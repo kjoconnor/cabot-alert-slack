@@ -1,12 +1,16 @@
 import json
 import os
+import StringIO
 
 import requests
 
 from cabot.cabotapp.alert import AlertPlugin
+from cabot.cabotapp.models import GraphiteStatusCheck
+from celery.utils.log import get_task_logger
 from django.conf import settings
 from django.template import Template, Context
 
+logger = get_task_logger(__name__)
 
 TEXT_TEMPLATE = "<{{ scheme }}://{{ host }}{% url 'service' pk=service.id %}|{{ service.name }}> {{ message }}"
 URL_TEMPLATE = "{{ scheme }}://{{ host }}{% url 'result' pk=check.last_result.id %}"
@@ -27,6 +31,47 @@ class SlackAlert(AlertPlugin):
 
     def send_alert_update(self, service, users, duty_officers):
         self._send_alert(service, acked=True)
+
+    def _generate_graph_url(self, check):
+        graph_buffer = self._get_graph(check)
+
+        graph_url = self._slack_file_upload(check, graph_buffer)
+        return graph_url
+
+    def _slack_file_upload(self, check, graph_buffer):
+        response = requests.post(
+            "https://slack.com/api/files.upload",
+            data={
+                'token': os.environ["SLACK_TOKEN"],
+            },
+            files={'file': graph_buffer},
+        ).json()
+
+        if response['ok']:
+            return response['file']['url_private']
+
+    def _get_graph(self, check):
+        targets = [
+            check.metric,
+            'alias(constantLine(%s),"Threshold")' % check.value,
+        ]
+
+        targets.extend(os.environ.get("SLACK_CUSTOM_TARGETS", []))
+
+        payload = {
+            'target': targets,
+            'from': settings.GRAPHITE_FROM,
+            'template': 'solarized-light',
+            'width': 600,
+        }
+
+        response = requests.get(
+            settings.GRAPHITE_API + 'render',
+            params=payload,
+            stream=True,
+        )
+
+        return StringIO.StringIO(response.content)
 
     def _send_alert(self, service, acked):
         overall_status = service.overall_status
@@ -67,6 +112,20 @@ class SlackAlert(AlertPlugin):
                 "color": color,
             }
             attachments.append(attachment)
+
+            if (isinstance(check, GraphiteStatusCheck) and
+                    os.environ.get("SLACK_TOKEN", False)):
+                try:
+                    graph_url = self._generate_graph_url(check)
+                    # TODO: this might need to be an .update to the [-1] element of attachments
+                    #       or just add to "attachment" and then do the append after this if block
+                    #       Also - slack seems to not like using internal Slack image links as the
+                    #       image_url of a message attachment. Waiting to hear back.
+                    attachments.append({
+                        "image_url": graph_url,
+                    })
+                except:
+                    logger.error("Couldn't fetch graph.")
 
         self._send_slack_webhook(text, attachments)
 
